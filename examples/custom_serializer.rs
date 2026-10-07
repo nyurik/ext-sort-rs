@@ -3,10 +3,11 @@ use std::fs::File;
 use std::io::{self, prelude::*, BufReader, BufWriter, Take};
 use std::path;
 
-use ext_sort::{ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
+use ext_sort::{ChunkReader, ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder};
 
 struct CustomExternalChunk {
-    reader: io::Take<io::BufReader<fs::File>>,
+    // reads small items faster than the `io::Take` the chunk is created with
+    reader: ChunkReader,
 }
 
 impl ExternalChunk<u32> for CustomExternalChunk {
@@ -14,7 +15,7 @@ impl ExternalChunk<u32> for CustomExternalChunk {
     type DeserializationError = io::Error;
 
     fn new(reader: Take<BufReader<File>>) -> Self {
-        CustomExternalChunk { reader }
+        CustomExternalChunk { reader: reader.into() }
     }
 
     fn dump(
@@ -33,7 +34,7 @@ impl Iterator for CustomExternalChunk {
     type Item = Result<u32, io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.reader.limit() == 0 {
+        if self.reader.is_empty() {
             None
         } else {
             let mut buf: [u8; 4] = [0; 4];

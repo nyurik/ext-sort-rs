@@ -92,6 +92,82 @@ pub trait ExternalChunk<T>: Sized + Iterator<Item = Result<T, Self::Deserializat
     ) -> Result<(), Self::SerializationError>;
 }
 
+/// Reader of a chunk file: a buffered reader limited to the chunk length, like [`io::Take`].
+///
+/// Unlike `io::Take`, it forwards [`Read::read_exact`] to the buffered reader, whose fast path copies
+/// straight from its buffer. `io::Take` runs the generic loop of `read` calls instead, which dominates
+/// the cost of decoders that read a few bytes at a time, such as MessagePack. Custom [`ExternalChunk`]
+/// implementations can convert the reader they are given with [`From`].
+pub struct ChunkReader {
+    inner: io::BufReader<fs::File>,
+    remaining: u64,
+}
+
+impl ChunkReader {
+    /// Returns the number of chunk bytes left to read.
+    #[inline]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Checks if the whole chunk has been read.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+impl From<io::Take<io::BufReader<fs::File>>> for ChunkReader {
+    fn from(reader: io::Take<io::BufReader<fs::File>>) -> Self {
+        let remaining = reader.limit();
+        ChunkReader {
+            inner: reader.into_inner(),
+            remaining,
+        }
+    }
+}
+
+impl Read for ChunkReader {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len().min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..len])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        if buf.len() as u64 > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "chunk ended in the middle of an item",
+            ));
+        }
+        self.inner.read_exact(buf)?;
+        self.remaining -= buf.len() as u64;
+        Ok(())
+    }
+}
+
+impl BufRead for ChunkReader {
+    #[inline]
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.remaining == 0 {
+            return Ok(&[]);
+        }
+        let buf = self.inner.fill_buf()?;
+        Ok(&buf[..buf.len().min(usize::try_from(self.remaining).unwrap_or(usize::MAX))])
+    }
+
+    #[inline]
+    fn consume(&mut self, amt: usize) {
+        let amt = amt.min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        self.inner.consume(amt);
+        self.remaining -= amt as u64;
+    }
+}
+
 /// RMP (Rust MessagePack) external chunk implementation.
 /// It uses MessagePack as a data serialization format.
 /// For more information see [msgpack.org](https://msgpack.org/).
@@ -106,7 +182,7 @@ pub trait ExternalChunk<T>: Sized + Iterator<Item = Result<T, Self::Deserializat
 /// let chunk: RmpExternalChunk<i32> = ExternalChunk::build(&dir, (0..1000), None).unwrap();
 /// ```
 pub struct RmpExternalChunk<T> {
-    reader: io::Take<io::BufReader<fs::File>>,
+    reader: ChunkReader,
 
     item_type: PhantomData<T>,
 }
@@ -120,7 +196,7 @@ where
 
     fn new(reader: io::Take<io::BufReader<fs::File>>) -> Self {
         RmpExternalChunk {
-            reader,
+            reader: reader.into(),
             item_type: PhantomData,
         }
     }
@@ -130,6 +206,8 @@ where
         items: impl IntoIterator<Item = T>,
     ) -> Result<(), Self::SerializationError> {
         for item in items {
+            // Passing `&mut &mut BufWriter` is deliberate: it inlines better than `&mut BufWriter`, which
+            // measured about a third more instructions.
             rmp_serde::encode::write(&mut chunk_writer, &item)?;
         }
 
@@ -144,7 +222,7 @@ where
     type Item = Result<T, <Self as ExternalChunk<T>>::DeserializationError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.reader.limit() == 0 {
+        if self.reader.is_empty() {
             None
         } else {
             match rmp_serde::decode::from_read(&mut self.reader) {
@@ -159,11 +237,40 @@ where
 mod test {
     use rstest::*;
 
-    use super::{ExternalChunk, RmpExternalChunk};
+    use std::io::{self, prelude::*};
+
+    use super::{ChunkReader, ExternalChunk, RmpExternalChunk};
 
     #[fixture]
     fn tmp_dir() -> tempfile::TempDir {
         tempfile::tempdir_in("./").unwrap()
+    }
+
+    #[rstest]
+    fn test_chunk_reader(tmp_dir: tempfile::TempDir) {
+        let path = tmp_dir.path().join("data");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // a reader buffer smaller than the data exercises both the buffered and the refill paths
+        let mut reader = ChunkReader::from(io::BufReader::with_capacity(4, file).take(8));
+
+        let mut buf = [0; 3];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"012");
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"345");
+        assert_eq!(reader.remaining(), 2);
+        assert_eq!(
+            reader.read_exact(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(reader.fill_buf().unwrap(), b"67");
+        reader.consume(1);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"7");
+        assert!(reader.is_empty());
+        assert_eq!(reader.fill_buf().unwrap(), b"");
     }
 
     #[rstest]
