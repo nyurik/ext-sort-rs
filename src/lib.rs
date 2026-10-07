@@ -64,5 +64,7 @@ pub mod sort;
 
 pub use buffer::{ChunkBuffer, ChunkBufferBuilder, LimitedBuffer, LimitedBufferBuilder};
 pub use chunk::{ExternalChunk, RmpExternalChunk};
+#[allow(deprecated)]
 pub use merger::BinaryHeapMerger;
+pub use merger::LoserTreeMerger;
 pub use sort::{ExternalSorter, ExternalSorterBuilder, SortError};

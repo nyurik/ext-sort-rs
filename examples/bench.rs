@@ -7,6 +7,7 @@
 //! ```
 //!
 //! `gen` only generates the keys; subtract it from the other modes to get the sorting cost.
+//! Set `BENCH_BUDGET_MIB` to change the memory budget, and with it the number of chunks to merge.
 //! The keys are composite, with long shared prefixes and an increasing sequence number: each input row
 //! yields one or two keys at each of 15 levels of a Hilbert-ordered quadtree, keyed by
 //! `(curve position, category, row)`.
@@ -17,7 +18,11 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use ext_sort::{ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder, RmpExternalChunk};
 
 const PAYLOAD: usize = 64;
-const BUDGET: usize = 256 << 20;
+
+/// Memory budget, 256 MiB unless overridden by `BENCH_BUDGET_MIB`; smaller budgets create more chunks.
+fn budget() -> usize {
+    std::env::var("BENCH_BUDGET_MIB").map_or(256, |mib| mib.parse().expect("budget in MiB")) << 20
+}
 const RW_BUF: usize = 256 << 10;
 
 /// Position along the Hilbert curve of a `2^level` square grid, after all positions of the coarser levels.
@@ -142,7 +147,7 @@ where
 {
     let record = vec![7u8; PAYLOAD];
     // Size chunks to the memory budget: payload + key + `Vec` header per item.
-    let items = BUDGET / (PAYLOAD + 16 + 24);
+    let items = budget() / (PAYLOAD + 16 + 24);
     let sorter: ExternalSorter<Item, io::Error, LimitedBufferBuilder, C> = ExternalSorterBuilder::new()
         .with_buffer(LimitedBufferBuilder::new(items, true))
         .with_threads_number(1)

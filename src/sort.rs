@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use crate::chunk::{ExternalChunk, ExternalChunkError, RmpExternalChunk};
-use crate::merger::BinaryHeapMerger;
+use crate::merger::LoserTreeMerger;
 use crate::{ChunkBuffer, ChunkBufferBuilder, LimitedBufferBuilder};
 
 /// Sorting error.
@@ -257,7 +257,7 @@ where
     pub fn sort<I>(
         &self,
         input: I,
-    ) -> SortResult<BinaryHeapMerger<T, C::DeserializationError, impl Fn(&T, &T) -> Ordering + Copy, C>, T, E, C>
+    ) -> SortResult<LoserTreeMerger<T, C::DeserializationError, impl Fn(&T, &T) -> Ordering + Copy, C>, T, E, C>
     where
         T: Ord,
         I: IntoIterator<Item = Result<T, E>>,
@@ -275,7 +275,7 @@ where
         &self,
         input: I,
         compare: F,
-    ) -> SortResult<BinaryHeapMerger<T, C::DeserializationError, F, C>, T, E, C>
+    ) -> SortResult<LoserTreeMerger<T, C::DeserializationError, F, C>, T, E, C>
     where
         I: IntoIterator<Item = Result<T, E>>,
         F: Fn(&T, &T) -> Ordering + Sync + Send + Copy,
@@ -301,7 +301,7 @@ where
 
         log::debug!("external sort preparation done");
 
-        Ok(BinaryHeapMerger::new(external_chunks, compare))
+        Ok(LoserTreeMerger::new(external_chunks, compare))
     }
 
     fn create_chunk<F>(&self, mut buffer: impl ChunkBuffer<T>, compare: F) -> Result<C, ChunkSortError<T, E, C>>
