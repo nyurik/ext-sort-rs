@@ -233,13 +233,145 @@ where
     }
 }
 
+/// Item with a compact binary encoding, stored by [`RawExternalChunk`].
+pub trait RawItem: Sized {
+    /// Appends the encoded item to `buf`.
+    fn encode(&self, buf: &mut Vec<u8>);
+
+    /// Decodes an item from exactly the bytes [`RawItem::encode`] appended.
+    fn decode(bytes: &[u8]) -> io::Result<Self>;
+}
+
+impl RawItem for Vec<u8> {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self);
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        Ok(bytes.to_vec())
+    }
+}
+
+impl RawItem for String {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.as_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        String::from_utf8(bytes.to_vec()).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+}
+
+/// External chunk storing [`RawItem`]s as `varint length | encoded item`, without a serialization
+/// framework. Items that are wholly in the read buffer are decoded in place, without copying them first.
+///
+/// # Example
+///
+/// ```no_run
+/// use tempfile::TempDir;
+/// use ext_sort::{ExternalChunk, RawExternalChunk};
+///
+/// let dir = TempDir::new().unwrap();
+/// let items = vec![b"hello".to_vec(), b"world".to_vec()];
+/// let chunk: RawExternalChunk<Vec<u8>> = ExternalChunk::build(&dir, items, None).unwrap();
+/// ```
+pub struct RawExternalChunk<T> {
+    reader: ChunkReader,
+    /// Holds items that straddle the end of the read buffer.
+    scratch: Vec<u8>,
+
+    item_type: PhantomData<T>,
+}
+
+impl<T: RawItem> RawExternalChunk<T> {
+    fn read_item(&mut self) -> io::Result<T> {
+        let len = read_varint(&mut self.reader)?;
+        let len = usize::try_from(len).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let buf = self.reader.fill_buf()?;
+        if let Some(bytes) = buf.get(..len) {
+            let item = T::decode(bytes)?;
+            self.reader.consume(len);
+            return Ok(item);
+        }
+        self.scratch.resize(len, 0);
+        self.reader.read_exact(&mut self.scratch)?;
+        T::decode(&self.scratch)
+    }
+}
+
+impl<T: RawItem> ExternalChunk<T> for RawExternalChunk<T> {
+    type SerializationError = io::Error;
+    type DeserializationError = io::Error;
+
+    fn new(reader: io::Take<io::BufReader<fs::File>>) -> Self {
+        RawExternalChunk {
+            reader: reader.into(),
+            scratch: Vec::new(),
+            item_type: PhantomData,
+        }
+    }
+
+    fn dump(chunk_writer: &mut io::BufWriter<fs::File>, items: impl IntoIterator<Item = T>) -> io::Result<()> {
+        // The varint length is written first, so each item is encoded into a reused buffer before writing.
+        let mut encoded = Vec::new();
+        let mut frame = Vec::with_capacity(MAX_VARINT_LEN);
+        for item in items {
+            encoded.clear();
+            item.encode(&mut encoded);
+            frame.clear();
+            write_varint(&mut frame, encoded.len() as u64);
+            chunk_writer.write_all(&frame)?;
+            chunk_writer.write_all(&encoded)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: RawItem> Iterator for RawExternalChunk<T> {
+    type Item = io::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reader.is_empty() {
+            None
+        } else {
+            Some(self.read_item())
+        }
+    }
+}
+
+const MAX_VARINT_LEN: usize = 10;
+
+/// Appends `value` as a LEB128 varint: 7 bits per byte, least significant first.
+fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+fn read_varint(reader: &mut impl Read) -> io::Result<u64> {
+    let mut value = 0;
+    for shift in (0..64).step_by(7) {
+        let mut byte = [0];
+        reader.read_exact(&mut byte)?;
+        value |= u64::from(byte[0] & 0x7f) << shift;
+        if byte[0] < 0x80 {
+            return Ok(value);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, "varint is too long"))
+}
+
 #[cfg(test)]
 mod test {
     use rstest::*;
 
     use std::io::{self, prelude::*};
 
-    use super::{ChunkReader, ExternalChunk, RmpExternalChunk};
+    use super::{
+        read_varint, write_varint, ChunkReader, ExternalChunk, RawExternalChunk, RmpExternalChunk, MAX_VARINT_LEN,
+    };
 
     #[fixture]
     fn tmp_dir() -> tempfile::TempDir {
@@ -271,6 +403,29 @@ mod test {
         assert_eq!(rest, b"7");
         assert!(reader.is_empty());
         assert_eq!(reader.fill_buf().unwrap(), b"");
+    }
+
+    #[rstest]
+    fn test_raw_chunk(tmp_dir: tempfile::TempDir) {
+        // Lengths up to 300 bytes need two varint bytes, and a 64 byte buffer makes items straddle refills.
+        let saved: Vec<Vec<u8>> = (0..300).map(|len| vec![len as u8; len]).collect();
+        let chunk: RawExternalChunk<Vec<u8>> = ExternalChunk::build(&tmp_dir, saved.clone(), Some(64)).unwrap();
+        let restored: Result<Vec<_>, _> = chunk.collect();
+        assert_eq!(restored.unwrap(), saved);
+
+        let chunk: RawExternalChunk<String> = ExternalChunk::build(&tmp_dir, Vec::<String>::new(), None).unwrap();
+        assert_eq!(chunk.count(), 0);
+    }
+
+    #[test]
+    fn test_varint() {
+        for value in [0, 1, 0x7f, 0x80, 300, u32::MAX.into(), u64::MAX] {
+            let mut buf = Vec::new();
+            write_varint(&mut buf, value);
+            assert!(buf.len() <= MAX_VARINT_LEN);
+            assert_eq!(read_varint(&mut buf.as_slice()).unwrap(), value);
+        }
+        assert!(read_varint(&mut [0xff; 11].as_slice()).is_err());
     }
 
     #[rstest]

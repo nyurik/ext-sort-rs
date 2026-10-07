@@ -15,7 +15,10 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-use ext_sort::{ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder, RmpExternalChunk};
+use ext_sort::{
+    ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder, RawExternalChunk, RawItem,
+    RmpExternalChunk,
+};
 
 const PAYLOAD: usize = 64;
 
@@ -120,6 +123,18 @@ impl ExternalChunk<Item> for RawChunk {
     }
 }
 
+impl RawItem for Item {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.0.to_le_bytes());
+        buf.extend_from_slice(&self.1);
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let (key, payload) = bytes.split_first_chunk().ok_or(io::ErrorKind::InvalidData)?;
+        Ok(Item(u128::from_le_bytes(*key), payload.to_vec()))
+    }
+}
+
 /// Checks the output order and folds it into a checksum that matches across modes.
 #[derive(Default)]
 struct Check {
@@ -176,6 +191,7 @@ fn main() {
         },
         "ext-rmp" => ext_sort::<RmpExternalChunk<Item>>(&keys),
         "ext-raw" => ext_sort::<RawChunk>(&keys),
+        "ext-rawchunk" => ext_sort::<RawExternalChunk<Item>>(&keys),
         _ => panic!("unknown mode {mode}"),
     };
     eprintln!("{mode}: {} records, checksum {}", check.count, check.sum);
