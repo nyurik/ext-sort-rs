@@ -68,6 +68,12 @@ where
         }
     }
 
+    /// Returns the number of merged inputs.
+    #[cfg(test)]
+    pub(crate) fn inputs(&self) -> usize {
+        self.chunks.len()
+    }
+
     fn prime(&mut self) -> Result<(), E> {
         while self.primed < self.chunks.len() {
             let idx = self.primed;

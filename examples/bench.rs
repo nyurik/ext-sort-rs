@@ -7,7 +7,8 @@
 //! ```
 //!
 //! `gen` only generates the keys; subtract it from the other modes to get the sorting cost.
-//! Set `BENCH_BUDGET_MIB` to change the memory budget, and with it the number of chunks to merge.
+//! Set `BENCH_BUDGET_MIB` to change the memory budget, and with it the number of chunks to merge, and
+//! `BENCH_MAX_FAN_IN` to limit how many chunks are merged at once.
 //! The keys are composite, with long shared prefixes and an increasing sequence number: each input row
 //! yields one or two keys at each of 15 levels of a Hilbert-ordered quadtree, keyed by
 //! `(curve position, category, row)`.
@@ -163,12 +164,14 @@ where
     let record = vec![7u8; PAYLOAD];
     // Size chunks to the memory budget: payload + key + `Vec` header per item.
     let items = budget() / (PAYLOAD + 16 + 24);
-    let sorter: ExternalSorter<Item, io::Error, LimitedBufferBuilder, C> = ExternalSorterBuilder::new()
+    let mut builder = ExternalSorterBuilder::new()
         .with_buffer(LimitedBufferBuilder::new(items, true))
         .with_threads_number(1)
-        .with_rw_buf_size(RW_BUF)
-        .build()
-        .unwrap();
+        .with_rw_buf_size(RW_BUF);
+    if let Ok(fan_in) = std::env::var("BENCH_MAX_FAN_IN") {
+        builder = builder.with_max_fan_in(fan_in.parse().expect("fan-in"));
+    }
+    let sorter: ExternalSorter<Item, io::Error, LimitedBufferBuilder, C> = builder.build().unwrap();
     let sorted = sorter
         .sort_by(keys.iter().map(|&k| Ok(Item(k, record.clone()))), |a, b| a.0.cmp(&b.0))
         .unwrap();

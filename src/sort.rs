@@ -85,6 +85,8 @@ where
     rw_buf_size: Option<usize>,
     /// Chunk buffer builder.
     buffer_builder: B,
+    /// Maximum number of chunks merged at once.
+    max_fan_in: Option<usize>,
 
     /// External chunk type.
     external_chunk_type: PhantomData<C>,
@@ -108,12 +110,14 @@ where
 
     /// Builds an [`ExternalSorter`] instance using provided configuration.
     pub fn build(self) -> SortResult<ExternalSorter<T, E, B, C>, T, E, C> {
-        ExternalSorter::new(
+        let mut sorter = ExternalSorter::new(
             self.threads_number,
             self.tmp_dir.as_deref(),
             self.buffer_builder,
             self.rw_buf_size,
-        )
+        )?;
+        sorter.max_fan_in = self.max_fan_in;
+        Ok(sorter)
     }
 
     /// Sets number of threads to be used to sort data in parallel.
@@ -131,6 +135,18 @@ where
     /// Sets buffer builder.
     pub fn with_buffer(mut self, buffer_builder: B) -> ExternalSorterBuilder<T, E, B, C> {
         self.buffer_builder = buffer_builder;
+        self
+    }
+
+    /// Sets the maximum number of chunks merged at once, at least 2. By default all chunks are merged at
+    /// once, which keeps every chunk file and its read buffer open until the sorted output is consumed.
+    ///
+    /// With a limit, whenever `max_fan_in` chunks of the same generation exist they are merged into a single
+    /// chunk of the next generation while the input is still being read, and any excess left at the end is
+    /// merged before the final merge. So at most about `max_fan_in` times the number of generations chunks
+    /// are open at any time, and each item is rewritten once per generation.
+    pub fn with_max_fan_in(mut self, max_fan_in: usize) -> ExternalSorterBuilder<T, E, B, C> {
+        self.max_fan_in = Some(max_fan_in.max(2));
         self
     }
 
@@ -154,6 +170,7 @@ where
             tmp_dir: None,
             rw_buf_size: None,
             buffer_builder: B::default(),
+            max_fan_in: None,
             external_chunk_type: PhantomData,
             item_type: PhantomData,
             input_error_type: PhantomData,
@@ -177,6 +194,8 @@ where
     buffer_builder: B,
     /// Chunk file read/write buffer size.
     rw_buf_size: Option<usize>,
+    /// Maximum number of chunks merged at once.
+    max_fan_in: Option<usize>,
 
     /// External chunk type.
     external_chunk_type: PhantomData<C>,
@@ -211,6 +230,7 @@ where
         Ok(ExternalSorter {
             rw_buf_size,
             buffer_builder,
+            max_fan_in: None,
             thread_pool: Self::init_thread_pool(threads_number)?,
             tmp_dir: Self::init_tmp_directory(tmp_path)?,
             external_chunk_type: PhantomData,
@@ -280,8 +300,8 @@ where
         I: IntoIterator<Item = Result<T, E>>,
         F: Fn(&T, &T) -> Ordering + Sync + Send + Copy,
     {
+        let mut runs = Vec::new();
         let mut chunk_buf = self.buffer_builder.build();
-        let mut external_chunks = Vec::new();
 
         for item in input.into_iter() {
             match item {
@@ -290,18 +310,33 @@ where
             }
 
             if chunk_buf.is_full() {
-                external_chunks.push(self.create_chunk(chunk_buf, compare)?);
+                runs.push(Run {
+                    chunk: self.create_chunk(chunk_buf, compare)?,
+                    generation: 0,
+                });
                 chunk_buf = self.buffer_builder.build();
+                self.merge_full_generations(&mut runs, compare)?;
             }
         }
 
         if !chunk_buf.is_empty() {
-            external_chunks.push(self.create_chunk(chunk_buf, compare)?);
+            runs.push(Run {
+                chunk: self.create_chunk(chunk_buf, compare)?,
+                generation: 0,
+            });
+        }
+
+        if let Some(fan_in) = self.max_fan_in {
+            while runs.len() > fan_in {
+                // Merging just enough of the latest, smallest runs leaves exactly `fan_in` for the final merge.
+                let count = (runs.len() - fan_in + 1).min(fan_in);
+                self.merge_last_runs(&mut runs, count, compare)?;
+            }
         }
 
         log::debug!("external sort preparation done");
 
-        Ok(LoserTreeMerger::new(external_chunks, compare))
+        Ok(LoserTreeMerger::new(runs.into_iter().map(|run| run.chunk), compare))
     }
 
     fn create_chunk<F>(&self, mut buffer: impl ChunkBuffer<T>, compare: F) -> Result<C, ChunkSortError<T, E, C>>
@@ -314,14 +349,67 @@ where
         });
 
         log::debug!("saving chunk data");
-        let external_chunk =
-            ExternalChunk::build(&self.tmp_dir, buffer, self.rw_buf_size).map_err(|err| match err {
-                ExternalChunkError::IO(err) => SortError::IO(err),
-                ExternalChunkError::SerializationError(err) => SortError::SerializationError(err),
-            })?;
-
-        Ok(external_chunk)
+        self.write_chunk(buffer)
     }
+
+    fn write_chunk(&self, items: impl IntoIterator<Item = T>) -> Result<C, ChunkSortError<T, E, C>> {
+        ExternalChunk::build(&self.tmp_dir, items, self.rw_buf_size).map_err(|err| match err {
+            ExternalChunkError::IO(err) => SortError::IO(err),
+            ExternalChunkError::SerializationError(err) => SortError::SerializationError(err),
+        })
+    }
+
+    /// Merges the latest runs while `max_fan_in` of them belong to the same generation, like carrying in a
+    /// counter, so the number of open runs grows only logarithmically with the input.
+    fn merge_full_generations<F>(&self, runs: &mut Vec<Run<C>>, compare: F) -> Result<(), ChunkSortError<T, E, C>>
+    where
+        F: Fn(&T, &T) -> Ordering,
+    {
+        let Some(fan_in) = self.max_fan_in else {
+            return Ok(());
+        };
+        while let Some(last) = runs.last() {
+            let generation = last.generation;
+            let same = runs.iter().rev().take_while(|run| run.generation == generation).count();
+            if same < fan_in {
+                break;
+            }
+            self.merge_last_runs(runs, fan_in, &compare)?;
+        }
+        Ok(())
+    }
+
+    /// Replaces the last `count` runs with a single run holding their merged items. The runs are adjacent,
+    /// and the merger breaks ties by run order, so the sort stays stable.
+    fn merge_last_runs<F>(
+        &self,
+        runs: &mut Vec<Run<C>>,
+        count: usize,
+        compare: F,
+    ) -> Result<(), ChunkSortError<T, E, C>>
+    where
+        F: Fn(&T, &T) -> Ordering,
+    {
+        let merged = runs.split_off(runs.len() - count);
+        let generation = merged.iter().map(|run| run.generation).max().unwrap_or_default() + 1;
+        log::debug!("merging {} chunks into a generation {} chunk", count, generation);
+
+        let mut error = None;
+        let items = LoserTreeMerger::new(merged.into_iter().map(|run| run.chunk), compare)
+            .map_while(|item| item.map_err(|err| error = Some(err)).ok());
+        let chunk = self.write_chunk(items)?;
+        if let Some(err) = error {
+            return Err(SortError::DeserializationError(err));
+        }
+        runs.push(Run { chunk, generation });
+        Ok(())
+    }
+}
+
+/// A sorted chunk and the number of merges its items went through.
+struct Run<C> {
+    chunk: C,
+    generation: u32,
 }
 
 #[cfg(test)]
@@ -414,5 +502,37 @@ mod test {
         };
 
         assert_eq!(actual_result, expected_result)
+    }
+
+    #[rstest]
+    #[case(None, 1000)]
+    #[case(Some(2), 1000)]
+    #[case(Some(3), 1000)]
+    #[case(Some(5), 1000)]
+    #[case(Some(3), 0)]
+    #[case(Some(3), 5)]
+    fn test_external_sorter_fan_in(#[case] max_fan_in: Option<usize>, #[case] len: usize) {
+        // few distinct keys, and the input position as payload, so stability is checked across merges
+        let mut rng = rand::thread_rng();
+        let input: Vec<(u8, usize)> = (0..len)
+            .map(|pos| (*[3, 1, 4, 1, 5].choose(&mut rng).unwrap(), pos))
+            .collect();
+        let mut expected = input.clone();
+        expected.sort_by_key(|item| item.0);
+
+        let mut builder = ExternalSorterBuilder::new()
+            .with_buffer(LimitedBufferBuilder::new(7, true))
+            .with_threads_number(1)
+            .with_tmp_dir(Path::new("./"));
+        if let Some(max_fan_in) = max_fan_in {
+            builder = builder.with_max_fan_in(max_fan_in);
+        }
+        let sorter: ExternalSorter<(u8, usize), io::Error> = builder.build().unwrap();
+
+        let result = sorter.sort_by(input.into_iter().map(Ok), |a, b| a.0.cmp(&b.0)).unwrap();
+        let chunks = len.div_ceil(7);
+        assert_eq!(result.inputs(), max_fan_in.map_or(chunks, |fan_in| chunks.min(fan_in)));
+        let actual: Vec<_> = result.map(Result::unwrap).collect();
+        assert_eq!(actual, expected);
     }
 }
