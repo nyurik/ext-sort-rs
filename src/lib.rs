@@ -60,6 +60,8 @@
 pub mod buffer;
 pub mod chunk;
 pub mod merger;
+pub mod radix;
+pub mod record;
 pub mod sort;
 
 pub use buffer::{ChunkBuffer, ChunkBufferBuilder, LimitedBuffer, LimitedBufferBuilder};
@@ -67,4 +69,6 @@ pub use chunk::{ChunkReader, ExternalChunk, RawExternalChunk, RawItem, RmpExtern
 #[allow(deprecated)]
 pub use merger::BinaryHeapMerger;
 pub use merger::LoserTreeMerger;
+pub use radix::RadixKey;
+pub use record::{RecordBuffer, RecordMerger, RecordSorter, RecordSorterBuilder};
 pub use sort::{ExternalSorter, ExternalSorterBuilder, SortError};

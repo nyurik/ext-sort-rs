@@ -16,6 +16,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
+use ext_sort::record::RecordSorterBuilder;
 use ext_sort::{
     ExternalChunk, ExternalSorter, ExternalSorterBuilder, LimitedBufferBuilder, RawExternalChunk, RawItem,
     RmpExternalChunk,
@@ -183,6 +184,27 @@ where
     check
 }
 
+/// Records pushed by reference into `RecordSorter`, which never allocates per record.
+fn record_sort(keys: &[u128]) -> Check {
+    let record = vec![7u8; PAYLOAD];
+    let sorter = RecordSorterBuilder::new()
+        .with_buffer_bytes(budget())
+        .with_rw_buf_size(RW_BUF)
+        .build::<u128>()
+        .unwrap();
+    let mut buffer = sorter.buffer();
+    for &key in keys {
+        buffer.push(key, &record).unwrap();
+    }
+    buffer.finish().unwrap();
+    let mut merger = sorter.merge().unwrap();
+    let mut check = Check::default();
+    while let Some((key, record)) = merger.next().unwrap() {
+        check.add(key, record);
+    }
+    check
+}
+
 fn main() {
     let mode = std::env::args().nth(1).expect("usage: bench <mode> [n]");
     let n: usize = std::env::args().nth(2).map_or(10_000_000, |s| s.parse().unwrap());
@@ -195,6 +217,7 @@ fn main() {
         "ext-rmp" => ext_sort::<RmpExternalChunk<Item>>(&keys),
         "ext-raw" => ext_sort::<RawChunk>(&keys),
         "ext-rawchunk" => ext_sort::<RawExternalChunk<Item>>(&keys),
+        "record" => record_sort(&keys),
         _ => panic!("unknown mode {mode}"),
     };
     eprintln!("{mode}: {} records, checksum {}", check.count, check.sum);
