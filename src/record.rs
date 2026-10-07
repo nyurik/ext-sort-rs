@@ -411,7 +411,7 @@ impl<K: RadixKey> RecordMerger<K> {
         let cursor = &self.cursors[winner];
         Ok(cursor.head.map(|key| {
             self.returned = Some(winner);
-            (key, cursor.record.as_slice())
+            (key, cursor.record())
         }))
     }
 }
@@ -430,6 +430,11 @@ struct Cursor<K> {
     reader: BufReader<File>,
     remaining: u64,
     head: Option<K>,
+    /// Length of the head record.
+    len: usize,
+    /// Whether the head record is lent straight from the read buffer, or was copied into `record` because
+    /// it straddles the end of the buffer.
+    in_buffer: bool,
     record: Vec<u8>,
 }
 
@@ -439,37 +444,89 @@ impl<K: RadixKey> Cursor<K> {
             reader: BufReader::with_capacity(rw_buf_size, run.file),
             remaining: run.records,
             head: None,
+            len: 0,
+            in_buffer: false,
             record: Vec::new(),
         };
         cursor.advance()?;
         Ok(cursor)
     }
 
+    #[inline]
+    fn record(&self) -> &[u8] {
+        if self.in_buffer {
+            &self.reader.buffer()[..self.len]
+        } else {
+            &self.record
+        }
+    }
+
     /// The record count is known, so any end of file while reading is a truncated run, not the end.
     fn advance(&mut self) -> io::Result<()> {
+        if self.in_buffer {
+            self.reader.consume(self.len);
+            self.in_buffer = false;
+        }
         if self.remaining == 0 {
             self.head = None;
             return Ok(());
         }
         self.remaining -= 1;
-        self.record.resize(K::BYTES, 0);
-        self.reader.read_exact(&mut self.record)?;
+
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "corrupt run file");
-        let key = K::read(&self.record).ok_or_else(invalid)?;
-        let mut len = 0u64;
-        for shift in (0..64).step_by(7) {
-            let mut byte = [0];
-            self.reader.read_exact(&mut byte)?;
-            len |= u64::from(byte[0] & 0x7f) << shift;
-            if byte[0] < 0x80 {
-                break;
-            }
+        if self.reader.buffer().is_empty() {
+            self.reader.fill_buf()?;
         }
-        self.record.resize(usize::try_from(len).map_err(|_| invalid())?, 0);
-        self.reader.read_exact(&mut self.record)?;
+        let buf = self.reader.buffer();
+        let (key, len) = if buf.len() >= K::BYTES + MAX_VARINT_LEN {
+            // The whole header is in the buffer, so it is parsed in place without copying.
+            let (key, rest) = buf.split_at(K::BYTES);
+            let key = K::read(key).ok_or_else(invalid)?;
+            let (len, varint_len) = decode_varint(rest).ok_or_else(invalid)?;
+            self.reader.consume(K::BYTES + varint_len);
+            (key, len)
+        } else {
+            self.record.resize(K::BYTES, 0);
+            self.reader.read_exact(&mut self.record)?;
+            let key = K::read(&self.record).ok_or_else(invalid)?;
+            let mut len = 0;
+            for shift in (0..64).step_by(7) {
+                let mut byte = [0];
+                self.reader.read_exact(&mut byte)?;
+                len |= u64::from(byte[0] & 0x7f) << shift;
+                if byte[0] < 0x80 {
+                    break;
+                }
+            }
+            (key, len)
+        };
+        self.len = usize::try_from(len).map_err(|_| invalid())?;
+
+        if self.reader.buffer().is_empty() {
+            self.reader.fill_buf()?;
+        }
+        if self.reader.buffer().len() >= self.len {
+            self.in_buffer = true;
+        } else {
+            self.record.resize(self.len, 0);
+            self.reader.read_exact(&mut self.record)?;
+        }
         self.head = Some(key);
         Ok(())
     }
+}
+
+/// Decodes a LEB128 varint from the start of `buf`, returning it and its length in bytes.
+#[inline]
+fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0;
+    for (i, &byte) in buf.iter().take(MAX_VARINT_LEN).enumerate() {
+        value |= u64::from(byte & 0x7f) << (7 * i);
+        if byte < 0x80 {
+            return Some((value, i + 1));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -577,18 +634,25 @@ mod test {
         let mut rng = rand::thread_rng();
         for n in [0, 1, 255, 256, 5000] {
             for spread in [1u128, 1 << 8, 1 << 40, u128::MAX] {
-                let mut entries: Vec<Entry<u128>> = (0..n)
-                    .map(|i| Entry {
-                        key: rng.gen_range(0..spread) << 16,
-                        offset: i,
-                        len: 0,
-                    })
-                    .collect();
-                let mut expected: Vec<(u128, u32)> = entries.iter().map(|e| (e.key, e.offset)).collect();
-                expected.sort_by_key(|e| e.0);
-                sort_entries(&mut entries, &mut Vec::new());
-                let actual: Vec<(u128, u32)> = entries.iter().map(|e| (e.key, e.offset)).collect();
-                assert_eq!(actual, expected, "n={n} spread={spread}");
+                // random keys, then keys whose low digits are a sequence, with ties, as the sort skips them
+                for variant in 0..3 {
+                    let mut entries: Vec<Entry<u128>> = (0..n)
+                        .map(|i| {
+                            let high = rng.gen_range(0..spread);
+                            let key = match variant {
+                                0 => high << 16,
+                                1 => high << 32 | u128::from(i),
+                                _ => high << 32 | u128::from(i / 7),
+                            };
+                            Entry { key, offset: i, len: 0 }
+                        })
+                        .collect();
+                    let mut expected: Vec<(u128, u32)> = entries.iter().map(|e| (e.key, e.offset)).collect();
+                    expected.sort_by_key(|e| e.0);
+                    sort_entries(&mut entries, &mut Vec::new());
+                    let actual: Vec<(u128, u32)> = entries.iter().map(|e| (e.key, e.offset)).collect();
+                    assert_eq!(actual, expected, "n={n} spread={spread} variant={variant}");
+                }
             }
         }
     }
