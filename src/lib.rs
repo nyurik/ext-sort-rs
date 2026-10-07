@@ -22,6 +22,13 @@
 //! * **Memory limit support:**
 //!   memory limited sorting is supported. It allows you to limit sorting memory consumption
 //!   (`memory-limit` feature required).
+//! * **Bounded fan-in:**
+//!   [`ExternalSorterBuilder::with_max_fan_in`] limits how many chunks are open and merged at once.
+//! * **Fast binary chunks:**
+//!   [`RawExternalChunk`] stores [`RawItem`]s as `length | bytes`, and [`ChunkReader`] speeds up custom chunks.
+//! * **Record sorter:**
+//!   [`record::RecordSorter`] sorts `(key, bytes)` records without allocating per record, from several
+//!   producer threads, using a radix sort on a compact index.
 //!
 //! # Example
 //!

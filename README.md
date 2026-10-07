@@ -39,6 +39,16 @@ For more information see [External Sorting](https://en.wikipedia.org/wiki/Extern
 * **Memory limit support:**
   memory limited sorting is supported. It allows you to limit sorting memory consumption
   (`memory-limit` feature required). 
+* **Bounded fan-in:**
+  `ExternalSorterBuilder::with_max_fan_in` limits how many chunks are open and merged at once, merging
+  chunks in intermediate passes when there are more.
+* **Fast binary chunks:**
+  `RawExternalChunk` stores items implementing the small `RawItem` trait as `length | bytes`, without a
+  serialization framework, and `ChunkReader` speeds up custom chunk implementations.
+* **Record sorter:**
+  `record::RecordSorter` sorts `(key, bytes)` records without allocating per record: records are kept in one
+  buffer per producer, only a compact index is radix sorted, several threads can push concurrently, and the
+  merger lends each record. For data of that shape it is several times faster than `ExternalSorter`.
 
 # Basic example
 
@@ -79,4 +89,32 @@ fn main() {
     }
     output_writer.flush().unwrap();
 }
+```
+
+# Record sorter example
+
+```rust
+use ext_sort::record::RecordSorterBuilder;
+
+let sorter = RecordSorterBuilder::new().with_buffer_bytes(64 << 20).build::<u64>().unwrap();
+let mut buffer = sorter.buffer();
+for (key, name) in [(3, "three"), (1, "one"), (2, "two")] {
+    buffer.push(key, name.as_bytes()).unwrap();
+}
+buffer.finish().unwrap();
+
+let mut merger = sorter.merge().unwrap();
+while let Some((key, record)) = merger.next().unwrap() {
+    println!("{key}: {}", String::from_utf8_lossy(record));
+}
+```
+
+# Benchmark
+
+`examples/bench.rs` sorts 10M records (a `u128` key and a 64-byte payload) with a 256 MiB budget on one thread,
+one mode per process, e.g.:
+
+```sh
+cargo build --release --example bench
+perf stat -e cycles:u,instructions:u target/release/examples/bench record 10000000
 ```
